@@ -222,14 +222,14 @@ class OverlayImageAtPosition:
         result_image = bg.unsqueeze(0).to(output_device)
         return (result_image,)
 
-# --- Node 3: VideoFrameZoomerWithCropWindowMask (MODIFIED) ---
+# --- Node 3: VideoFrameZoomerWithCropWindowMask (NEW NODE) ---
 class VideoFrameZoomerWithCropWindowMask:
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
                 "image": ("IMAGE",),
-                "mask": ("MASK",),
+                "mask": ("MASK",), 
                 "target_zoom_factor": ("FLOAT", {"default": 2.0, "min": 0.1, "max": 16.0, "step": 0.1}),
                 "roi_padding_percent": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 2.0, "step": 0.05}),
                 "mask_threshold_for_bbox": ("FLOAT", {"default": 0.5, "min": 0.01, "max": 0.99, "step": 0.01}),
@@ -238,71 +238,62 @@ class VideoFrameZoomerWithCropWindowMask:
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "MASK", "MASK", "FLOAT", "INT", "INT", "INT", "INT")
+    RETURN_TYPES = ("IMAGE", "MASK", "MASK", "FLOAT", "INT", "INT", "INT", "INT") 
     RETURN_NAMES = ("ZOOMED_IMAGE", "SAMPLER_INPAINT_MASK", "CROP_WINDOW_ON_ORIGINAL_IMAGE_MASK",
-                    "APPLIED_ZOOM_FACTOR",
+                    "APPLIED_ZOOM_FACTOR", 
                     "ROI_X_ON_ORIGINAL", "ROI_Y_ON_ORIGINAL",
                     "ZOOMED_IMAGE_WIDTH", "ZOOMED_IMAGE_HEIGHT")
-    FUNCTION = "process_batch" # Renamed for clarity, as it now handles batches
-    CATEGORY = "utils/image"
+    FUNCTION = "process_frame"
+    CATEGORY = "utils/image" # Changed category to match others, or use "VideoTools/Detailer"
 
-    def process_frame_logic(self, image_pil: Image.Image, original_segmentation_mask_pil: Image.Image,
-                            target_zoom_factor: float,
-                            roi_padding_percent: float, mask_threshold_for_bbox: float,
-                            dilate_sampler_mask_pixels: int,
-                            feather_crop_window_mask_pixels: int):
-        # This method contains the logic for a single frame
-        orig_img_w, orig_img_h = image_pil.size
+    def process_frame(self, image: torch.Tensor, mask: torch.Tensor, 
+                      target_zoom_factor: float,
+                      roi_padding_percent: float, mask_threshold_for_bbox: float,
+                      dilate_sampler_mask_pixels: int,
+                      feather_crop_window_mask_pixels: int):
+
+        img_pil = tensor_to_pil(image) # Expects B,H,W,C
+        original_segmentation_mask_pil = tensor_to_pil(mask) # Expects B,H,W
+
+        orig_img_w, orig_img_h = img_pil.size
 
         padded_roi_orig_coords = get_mask_bbox(original_segmentation_mask_pil, mask_threshold_for_bbox, roi_padding_percent, orig_img_w, orig_img_h)
-
-        # Determine a consistent dummy output size based on the first frame if needed
-        # For simplicity, we'll calculate dummy based on current frame, but for batch consistency,
-        # it might be better to base it on the first frame of the batch.
-        # However, the node outputs single scalar values for width/height, implying they should be consistent.
-        # Let's assume the node is expected to make them consistent or report first frame's.
-        dummy_output_w = round_to_multiple(orig_img_w / 2, 16, 64)
+        
+        dummy_output_w = round_to_multiple(orig_img_w / 2, 16, 64) 
         dummy_output_h = round_to_multiple(orig_img_h / 2, 16, 64)
 
         if padded_roi_orig_coords is None:
-            # print(f"Warning: VideoFrameZoomer (frame) could not determine ROI. Dummy outputs.")
-            zoomed_image_pil = Image.new("RGB", (dummy_output_w, dummy_output_h), "black")
-            sampler_inpaint_mask_pil = Image.new("L", (dummy_output_w, dummy_output_h), "black")
-            crop_window_mask_pil = Image.new("L", (orig_img_w, orig_img_h), "black")
-            applied_zoom_factor = 1.0
-            roi_x_on_original = 0
-            roi_y_on_original = 0
-            current_zoomed_image_width = dummy_output_w
-            current_zoomed_image_height = dummy_output_h
-            return (zoomed_image_pil, sampler_inpaint_mask_pil, crop_window_mask_pil,
-                    applied_zoom_factor, roi_x_on_original, roi_y_on_original,
-                    current_zoomed_image_width, current_zoomed_image_height)
-
-        pr_x, pr_y, pr_w, pr_h = padded_roi_orig_coords
-
-        if pr_w <= 0 or pr_h <= 0:
-            # print(f"Warning: VideoFrameZoomer (frame) invalid padded ROI. Using full image.")
+            # print("Error: VideoFrameZoomer could not determine ROI. Dummy outputs.") # Less verbose
+            dummy_zi = pil_to_tensor(Image.new("RGB", (dummy_output_w, dummy_output_h), "black"))
+            dummy_sim = pil_to_tensor(Image.new("L", (dummy_output_w, dummy_output_h), "black"))
+            dummy_cwom = pil_to_tensor(Image.new("L", (orig_img_w, orig_img_h), "black"))
+            return (dummy_zi, dummy_sim, dummy_cwom, 1.0, 0, 0, dummy_output_w, dummy_output_h)
+            
+        pr_x, pr_y, pr_w, pr_h = padded_roi_orig_coords 
+        
+        if pr_w <=0 or pr_h <=0:
+            # print(f"Warning: VideoFrameZoomer invalid padded ROI. Using full image.") # Less verbose
             pr_x, pr_y, pr_w, pr_h = 0.0, 0.0, float(orig_img_w), float(orig_img_h)
 
         initial_target_w = pr_w * target_zoom_factor
         initial_target_h = pr_h * target_zoom_factor
-        current_zoomed_image_width = round_to_multiple(initial_target_w, 16, min_val=16)
-        current_zoomed_image_height = round_to_multiple(initial_target_h, 16, min_val=16)
+        zoomed_image_width = round_to_multiple(initial_target_w, 16, min_val=16)
+        zoomed_image_height = round_to_multiple(initial_target_h, 16, min_val=16)
 
-        target_aspect = float(current_zoomed_image_width) / current_zoomed_image_height if current_zoomed_image_height > 0 else 1.0
+        target_aspect = float(zoomed_image_width) / zoomed_image_height if zoomed_image_height > 0 else 1.0
         padded_roi_center_x = pr_x + pr_w / 2.0
         padded_roi_center_y = pr_y + pr_h / 2.0
 
-        if pr_w == 0 or pr_h == 0:
-             fc_w = pr_w
+        if pr_w == 0 or pr_h == 0 : # Avoid division by zero if pr_h is 0
+             fc_w = pr_w 
              fc_h = pr_h
         elif pr_w / pr_h > target_aspect:
             fc_w = pr_w
-            fc_h = pr_w / target_aspect if target_aspect > 0 else pr_h
+            fc_h = pr_w / target_aspect if target_aspect > 0 else pr_h # Avoid division by zero
         else:
             fc_h = pr_h
             fc_w = pr_h * target_aspect
-
+        
         fc_x = padded_roi_center_x - fc_w / 2.0
         fc_y = padded_roi_center_y - fc_h / 2.0
 
@@ -314,190 +305,73 @@ class VideoFrameZoomerWithCropWindowMask:
         src_rect_h = src_crop_y_end - src_crop_y
         dst_paste_x_on_canvas = src_crop_x - fc_x
         dst_paste_y_on_canvas = src_crop_y - fc_y
-
+        
         int_fc_w, int_fc_h = int(round(fc_w)), int(round(fc_h))
         if int_fc_w <= 0 or int_fc_h <= 0:
-            # print(f"Error: VideoFrameZoomer (frame) final crop canvas dimensions invalid. Dummy.")
-            zoomed_image_pil = Image.new("RGB", (current_zoomed_image_width, current_zoomed_image_height), "black")
-            sampler_inpaint_mask_pil = Image.new("L", (current_zoomed_image_width, current_zoomed_image_height), "black")
-            crop_window_mask_pil = Image.new("L", (orig_img_w, orig_img_h), "black")
-            applied_zoom_factor = 1.0
-            roi_x_on_original = 0
-            roi_y_on_original = 0
-            return (zoomed_image_pil, sampler_inpaint_mask_pil, crop_window_mask_pil,
-                    applied_zoom_factor, roi_x_on_original, roi_y_on_original,
-                    current_zoomed_image_width, current_zoomed_image_height)
-
+            # print(f"Error: VideoFrameZoomer final crop canvas dimensions invalid. Dummy.") # Less verbose
+            dummy_zi = pil_to_tensor(Image.new("RGB", (zoomed_image_width, zoomed_image_height), "black"))
+            dummy_sim = pil_to_tensor(Image.new("L", (zoomed_image_width, zoomed_image_height), "black"))
+            dummy_cwom = pil_to_tensor(Image.new("L", (orig_img_w, orig_img_h), "black"))
+            return (dummy_zi, dummy_sim, dummy_cwom, 1.0, 0, 0, zoomed_image_width, zoomed_image_height)
 
         img_canvas_unscaled = Image.new("RGB", (int_fc_w, int_fc_h), (0,0,0))
-        mask_canvas_unscaled = Image.new("L", (int_fc_w, int_fc_h), 0)
+        mask_canvas_unscaled = Image.new("L", (int_fc_w, int_fc_h), 0) 
         if src_rect_w > 0 and src_rect_h > 0:
-            img_cropped_from_orig = image_pil.crop((int(round(src_crop_x)), int(round(src_crop_y)),
+            img_cropped_from_orig = img_pil.crop((int(round(src_crop_x)), int(round(src_crop_y)), 
                                                   int(round(src_crop_x_end)), int(round(src_crop_y_end))))
             mask_content_cropped = original_segmentation_mask_pil.crop((int(round(src_crop_x)), int(round(src_crop_y)),
                                                                         int(round(src_crop_x_end)), int(round(src_crop_y_end))))
             img_canvas_unscaled.paste(img_cropped_from_orig, (int(round(dst_paste_x_on_canvas)), int(round(dst_paste_y_on_canvas))))
             mask_canvas_unscaled.paste(mask_content_cropped, (int(round(dst_paste_x_on_canvas)), int(round(dst_paste_y_on_canvas))))
-
-        zoomed_image_pil = img_canvas_unscaled.resize((current_zoomed_image_width, current_zoomed_image_height), Image.LANCZOS)
-        sampler_inpaint_mask_pil = mask_canvas_unscaled.resize((current_zoomed_image_width, current_zoomed_image_height), Image.NEAREST)
-
+        
+        zoomed_image_pil = img_canvas_unscaled.resize((zoomed_image_width, zoomed_image_height), Image.LANCZOS)
+        sampler_inpaint_mask_pil = mask_canvas_unscaled.resize((zoomed_image_width, zoomed_image_height), Image.NEAREST)
+        
         if dilate_sampler_mask_pixels > 0:
             filter_size = dilate_sampler_mask_pixels * 2 + 1
-            if filter_size > 1:
+            if filter_size > 1: 
                  sampler_inpaint_mask_pil = sampler_inpaint_mask_pil.filter(ImageFilter.MaxFilter(size=filter_size))
-
+        
+        zoomed_image_tensor = pil_to_tensor(zoomed_image_pil) 
+        sampler_inpaint_mask_tensor = pil_to_tensor(sampler_inpaint_mask_pil)
+        
         crop_window_mask_pil = Image.new("L", (orig_img_w, orig_img_h), 0)
         draw_crop_window = ImageDraw.Draw(crop_window_mask_pil)
         fc_box_rect_on_orig = (
             int(round(fc_x)), int(round(fc_y)),
             int(round(fc_x + fc_w)), int(round(fc_y + fc_h))
         )
-        draw_crop_window.rectangle(fc_box_rect_on_orig, fill=255)
+        draw_crop_window.rectangle(fc_box_rect_on_orig, fill=255) 
         if feather_crop_window_mask_pixels > 0:
-            radius = feather_crop_window_mask_pixels
+            radius = feather_crop_window_mask_pixels # Treat as radius for GaussianBlur
             if radius > 0:
                 crop_window_mask_pil = crop_window_mask_pil.filter(ImageFilter.GaussianBlur(radius=radius))
+        
+        crop_window_mask_tensor = pil_to_tensor(crop_window_mask_pil)
 
-        applied_zoom_factor = float(current_zoomed_image_width) / fc_w if fc_w > 0 else 1.0
+        applied_zoom_factor = float(zoomed_image_width) / fc_w if fc_w > 0 else 1.0
         roi_x_on_original = int(round(fc_x))
         roi_y_on_original = int(round(fc_y))
 
-        return (zoomed_image_pil, sampler_inpaint_mask_pil, crop_window_mask_pil,
-                applied_zoom_factor, roi_x_on_original, roi_y_on_original,
-                current_zoomed_image_width, current_zoomed_image_height)
-
-    def process_batch(self, image: torch.Tensor, mask: torch.Tensor,
-                      target_zoom_factor: float,
-                      roi_padding_percent: float, mask_threshold_for_bbox: float,
-                      dilate_sampler_mask_pixels: int,
-                      feather_crop_window_mask_pixels: int):
-
-        batch_size = image.shape[0]
-        if mask.shape[0] != batch_size:
-            raise ValueError(f"Image batch size ({image.shape[0]}) and Mask batch size ({mask.shape[0]}) must match.")
-
-        output_zoomed_images_pil = []
-        output_sampler_masks_pil = []
-        output_crop_window_masks_pil = []
-
-        # Scalar outputs will be taken from the first successfully processed frame
-        # Initialize with defaults
-        final_applied_zoom_factor = 1.0
-        final_roi_x = 0
-        final_roi_y = 0
-        final_zoomed_w = 0
-        final_zoomed_h = 0
-        first_frame_processed = False
-
-        # Determine target dimensions for zoomed outputs from the first *successfully processed* frame
-        # to ensure all stacked tensors have the same dimensions.
-        target_zoomed_w_for_stacking = None
-        target_zoomed_h_for_stacking = None
-        
-        original_input_w = 0
-        original_input_h = 0
-        if batch_size > 0:
-            # Get original dimensions from the first frame's tensor (before PIL conversion)
-            # Assuming HWC or HW format for tensor_to_pil to correctly get width/height
-            temp_first_image_pil = tensor_to_pil(image, batch_index=0)
-            original_input_w, original_input_h = temp_first_image_pil.size
-
-
-        for i in range(batch_size):
-            current_image_pil = tensor_to_pil(image, batch_index=i)
-            current_mask_pil = tensor_to_pil(mask, batch_index=i)
-
-            (zoomed_img_pil, sampler_mask_pil, crop_window_pil,
-             applied_zoom, roi_x, roi_y,
-             current_z_w, current_z_h) = self.process_frame_logic(
-                current_image_pil, current_mask_pil,
-                target_zoom_factor, roi_padding_percent, mask_threshold_for_bbox,
-                dilate_sampler_mask_pixels, feather_crop_window_mask_pixels
-            )
-
-            if not first_frame_processed and current_z_w > 0 and current_z_h > 0: # Successfully processed a frame
-                final_applied_zoom_factor = applied_zoom
-                final_roi_x = roi_x
-                final_roi_y = roi_y
-                final_zoomed_w = current_z_w # Report this size
-                final_zoomed_h = current_z_h # Report this size
-                target_zoomed_w_for_stacking = current_z_w # Use this for resizing all frames
-                target_zoomed_h_for_stacking = current_z_h
-                first_frame_processed = True
-            
-            # If this is the first frame and it failed, we need default dimensions for stacking
-            if target_zoomed_w_for_stacking is None:
-                target_zoomed_w_for_stacking = round_to_multiple(original_input_w / 2, 16, 64) if original_input_w > 0 else 64
-            if target_zoomed_h_for_stacking is None:
-                target_zoomed_h_for_stacking = round_to_multiple(original_input_h / 2, 16, 64) if original_input_h > 0 else 64
-
-
-            # Ensure consistent sizing for stacking
-            if zoomed_img_pil.size != (target_zoomed_w_for_stacking, target_zoomed_h_for_stacking):
-                zoomed_img_pil = zoomed_img_pil.resize((target_zoomed_w_for_stacking, target_zoomed_h_for_stacking), Image.LANCZOS)
-            if sampler_mask_pil.size != (target_zoomed_w_for_stacking, target_zoomed_h_for_stacking):
-                sampler_mask_pil = sampler_mask_pil.resize((target_zoomed_w_for_stacking, target_zoomed_h_for_stacking), Image.NEAREST)
-            # crop_window_pil is already original image size, no need to resize for stacking (its content changes, not its overall frame size)
-
-            output_zoomed_images_pil.append(zoomed_img_pil)
-            output_sampler_masks_pil.append(sampler_mask_pil)
-            output_crop_window_masks_pil.append(crop_window_pil)
-
-        if not output_zoomed_images_pil: # Empty batch or all frames failed
-            # Create a single dummy output if batch was empty or all failed
-            # Use original_input_w/h if available, else fallback
-            oiw = original_input_w if original_input_w > 0 else 512
-            oih = original_input_h if original_input_h > 0 else 512
-            
-            dummy_w = round_to_multiple(oiw / 2, 16, 64)
-            dummy_h = round_to_multiple(oih / 2, 16, 64)
-
-            dummy_zi_pil = Image.new("RGB", (dummy_w, dummy_h), "black")
-            dummy_sim_pil = Image.new("L", (dummy_w, dummy_h), "black")
-            dummy_cwom_pil = Image.new("L", (oiw, oih), "black")
-            
-            zoomed_image_tensor = pil_to_tensor(dummy_zi_pil)
-            sampler_inpaint_mask_tensor = pil_to_tensor(dummy_sim_pil)
-            crop_window_mask_tensor = pil_to_tensor(dummy_cwom_pil)
-            
-            final_zoomed_w = dummy_w # Update reported size for dummy
-            final_zoomed_h = dummy_h
-        else:
-            # Convert lists of PIL images to batched tensors
-            # pil_to_tensor adds a batch dim, so squeeze it before stacking
-            zoomed_image_tensor_list = [pil_to_tensor(img).squeeze(0) for img in output_zoomed_images_pil]
-            sampler_mask_tensor_list = [pil_to_tensor(mask_p).squeeze(0) for mask_p in output_sampler_masks_pil]
-            crop_window_mask_tensor_list = [pil_to_tensor(mask_p).squeeze(0) for mask_p in output_crop_window_masks_pil]
-
-            zoomed_image_tensor = torch.stack(zoomed_image_tensor_list, dim=0)
-            sampler_inpaint_mask_tensor = torch.stack(sampler_mask_tensor_list, dim=0)
-            crop_window_mask_tensor = torch.stack(crop_window_mask_tensor_list, dim=0)
-            
-            # If no frame was successfully processed, update final_zoomed_w/h to the target stacking size
-            if not first_frame_processed:
-                final_zoomed_w = target_zoomed_w_for_stacking if target_zoomed_w_for_stacking else 0
-                final_zoomed_h = target_zoomed_h_for_stacking if target_zoomed_h_for_stacking else 0
-
-
         return (zoomed_image_tensor, sampler_inpaint_mask_tensor, crop_window_mask_tensor,
-                final_applied_zoom_factor,
-                final_roi_x, final_roi_y,
-                final_zoomed_w, final_zoomed_h)
+                applied_zoom_factor, 
+                roi_x_on_original, roi_y_on_original,
+                zoomed_image_width, zoomed_image_height)
 
 
 # --- Registration: Update mappings ---
 NODE_CLASS_MAPPINGS = {
     "Mask Get Bounding Coords": MaskGetCoords,
     "OverlayImageAtPosition": OverlayImageAtPosition,
-    "VideoFrameZoomerWithCropWindowMask": VideoFrameZoomerWithCropWindowMask
+    "VideoFrameZoomerWithCropWindowMask": VideoFrameZoomerWithCropWindowMask # Added new node
 }
 
 # --- Display Name Mappings: Update display name ---
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Mask Get Bounding Coords": "Get Mask Coords",
     "OverlayImageAtPosition": "Overlay Image at Position",
-    "VideoFrameZoomerWithCropWindowMask": "Zoom Frame for Detailer"
+    "VideoFrameZoomerWithCropWindowMask": "Zoom Frame for Detailer" # Added display name
 }
 
-print("--- My Custom Nodes Loaded: Mask/Image Utils (with Zoomer v2 - Batch Fix) ---")
+# (Keep the print statement at the end if you like)
+print("--- My Custom Nodes Loaded: Mask/Image Utils (with Zoomer) ---")
