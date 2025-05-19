@@ -252,27 +252,37 @@ class VideoFrameZoomerWithCropWindowMask:
                       dilate_sampler_mask_pixels: int,
                       feather_crop_window_mask_pixels: int):
 
-        img_pil = tensor_to_pil(image) # Expects B,H,W,C
-        original_segmentation_mask_pil = tensor_to_pil(mask) # Expects B,H,W
+        # 支持batch输入，image: (N,H,W,C), mask: (N,H,W) 或 (N,H,W,1)
+        if mask.dim() == 4 and mask.shape[-1] == 1:
+            mask = mask.squeeze(-1)  # (N,H,W)
+        if image.dim() == 4 and image.shape[-1] == 1:
+            image = image.squeeze(-1)  # (N,H,W) 但一般IMAGE是(N,H,W,C)
 
+        batch_size = image.shape[0]
+        # 合并所有mask，得到联合区域
+        merged_mask = torch.max(mask, dim=0)[0]  # (H,W)
+        merged_mask_pil = tensor_to_pil(merged_mask.unsqueeze(0))  # (1,H,W) -> PIL
+
+        # 取第一帧的尺寸作为原图尺寸
+        img_pil = tensor_to_pil(image, batch_index=0)
         orig_img_w, orig_img_h = img_pil.size
 
-        padded_roi_orig_coords = get_mask_bbox(original_segmentation_mask_pil, mask_threshold_for_bbox, roi_padding_percent, orig_img_w, orig_img_h)
-        
+        padded_roi_orig_coords = get_mask_bbox(
+            merged_mask_pil, mask_threshold_for_bbox, roi_padding_percent, orig_img_w, orig_img_h
+        )
+
         dummy_output_w = round_to_multiple(orig_img_w / 2, 16, 64) 
         dummy_output_h = round_to_multiple(orig_img_h / 2, 16, 64)
 
         if padded_roi_orig_coords is None:
-            # print("Error: VideoFrameZoomer could not determine ROI. Dummy outputs.") # Less verbose
             dummy_zi = pil_to_tensor(Image.new("RGB", (dummy_output_w, dummy_output_h), "black"))
             dummy_sim = pil_to_tensor(Image.new("L", (dummy_output_w, dummy_output_h), "black"))
             dummy_cwom = pil_to_tensor(Image.new("L", (orig_img_w, orig_img_h), "black"))
-            return (dummy_zi, dummy_sim, dummy_cwom, 1.0, 0, 0, dummy_output_w, dummy_output_h)
-            
-        pr_x, pr_y, pr_w, pr_h = padded_roi_orig_coords 
+            # 输出batch
+            return (dummy_zi.repeat(batch_size,1,1,1), dummy_sim.repeat(batch_size,1,1), dummy_cwom, 1.0, 0, 0, dummy_output_w, dummy_output_h)
         
+        pr_x, pr_y, pr_w, pr_h = padded_roi_orig_coords 
         if pr_w <=0 or pr_h <=0:
-            # print(f"Warning: VideoFrameZoomer invalid padded ROI. Using full image.") # Less verbose
             pr_x, pr_y, pr_w, pr_h = 0.0, 0.0, float(orig_img_w), float(orig_img_h)
 
         initial_target_w = pr_w * target_zoom_factor
@@ -297,44 +307,41 @@ class VideoFrameZoomerWithCropWindowMask:
         fc_x = padded_roi_center_x - fc_w / 2.0
         fc_y = padded_roi_center_y - fc_h / 2.0
 
-        src_crop_x = max(0, fc_x)
-        src_crop_y = max(0, fc_y)
-        src_crop_x_end = min(orig_img_w, fc_x + fc_w)
-        src_crop_y_end = min(orig_img_h, fc_y + fc_h)
-        src_rect_w = src_crop_x_end - src_crop_x
-        src_rect_h = src_crop_y_end - src_crop_y
-        dst_paste_x_on_canvas = src_crop_x - fc_x
-        dst_paste_y_on_canvas = src_crop_y - fc_y
-        
-        int_fc_w, int_fc_h = int(round(fc_w)), int(round(fc_h))
-        if int_fc_w <= 0 or int_fc_h <= 0:
-            # print(f"Error: VideoFrameZoomer final crop canvas dimensions invalid. Dummy.") # Less verbose
-            dummy_zi = pil_to_tensor(Image.new("RGB", (zoomed_image_width, zoomed_image_height), "black"))
-            dummy_sim = pil_to_tensor(Image.new("L", (zoomed_image_width, zoomed_image_height), "black"))
-            dummy_cwom = pil_to_tensor(Image.new("L", (orig_img_w, orig_img_h), "black"))
-            return (dummy_zi, dummy_sim, dummy_cwom, 1.0, 0, 0, zoomed_image_width, zoomed_image_height)
+        # 下面对每一帧都做同样的crop+resize
+        zoomed_images = []
+        sampler_inpaint_masks = []
+        for i in range(batch_size):
+            img_pil = tensor_to_pil(image, batch_index=i)
+            mask_pil = tensor_to_pil(mask, batch_index=i) if mask.dim()==3 else tensor_to_pil(mask.unsqueeze(-1), batch_index=i)
+            img_canvas_unscaled = Image.new("RGB", (int(round(fc_w)), int(round(fc_h))), (0,0,0))
+            mask_canvas_unscaled = Image.new("L", (int(round(fc_w)), int(round(fc_h))), 0) 
 
-        img_canvas_unscaled = Image.new("RGB", (int_fc_w, int_fc_h), (0,0,0))
-        mask_canvas_unscaled = Image.new("L", (int_fc_w, int_fc_h), 0) 
-        if src_rect_w > 0 and src_rect_h > 0:
-            img_cropped_from_orig = img_pil.crop((int(round(src_crop_x)), int(round(src_crop_y)), 
-                                                  int(round(src_crop_x_end)), int(round(src_crop_y_end))))
-            mask_content_cropped = original_segmentation_mask_pil.crop((int(round(src_crop_x)), int(round(src_crop_y)),
-                                                                        int(round(src_crop_x_end)), int(round(src_crop_y_end))))
-            img_canvas_unscaled.paste(img_cropped_from_orig, (int(round(dst_paste_x_on_canvas)), int(round(dst_paste_y_on_canvas))))
-            mask_canvas_unscaled.paste(mask_content_cropped, (int(round(dst_paste_x_on_canvas)), int(round(dst_paste_y_on_canvas))))
-        
-        zoomed_image_pil = img_canvas_unscaled.resize((zoomed_image_width, zoomed_image_height), Image.LANCZOS)
-        sampler_inpaint_mask_pil = mask_canvas_unscaled.resize((zoomed_image_width, zoomed_image_height), Image.NEAREST)
-        
-        if dilate_sampler_mask_pixels > 0:
-            filter_size = dilate_sampler_mask_pixels * 2 + 1
-            if filter_size > 1: 
-                 sampler_inpaint_mask_pil = sampler_inpaint_mask_pil.filter(ImageFilter.MaxFilter(size=filter_size))
-        
-        zoomed_image_tensor = pil_to_tensor(zoomed_image_pil) 
-        sampler_inpaint_mask_tensor = pil_to_tensor(sampler_inpaint_mask_pil)
-        
+            src_crop_x = max(0, fc_x)
+            src_crop_y = max(0, fc_y)
+            src_crop_x_end = min(orig_img_w, fc_x + fc_w)
+            src_crop_y_end = min(orig_img_h, fc_y + fc_h)
+            dst_paste_x_on_canvas = src_crop_x - fc_x
+            dst_paste_y_on_canvas = src_crop_y - fc_y
+
+            if (src_crop_x_end-src_crop_x)>0 and (src_crop_y_end-src_crop_y)>0:
+                img_cropped = img_pil.crop((int(round(src_crop_x)), int(round(src_crop_y)), int(round(src_crop_x_end)), int(round(src_crop_y_end))))
+                mask_cropped = mask_pil.crop((int(round(src_crop_x)), int(round(src_crop_y)), int(round(src_crop_x_end)), int(round(src_crop_y_end))))
+                img_canvas_unscaled.paste(img_cropped, (int(round(dst_paste_x_on_canvas)), int(round(dst_paste_y_on_canvas))))
+                mask_canvas_unscaled.paste(mask_cropped, (int(round(dst_paste_x_on_canvas)), int(round(dst_paste_y_on_canvas))))
+            zoomed_image_pil = img_canvas_unscaled.resize((zoomed_image_width, zoomed_image_height), Image.LANCZOS)
+            sampler_inpaint_mask_pil = mask_canvas_unscaled.resize((zoomed_image_width, zoomed_image_height), Image.NEAREST)
+            if dilate_sampler_mask_pixels > 0:
+                filter_size = dilate_sampler_mask_pixels * 2 + 1
+                if filter_size > 1: 
+                    sampler_inpaint_mask_pil = sampler_inpaint_mask_pil.filter(ImageFilter.MaxFilter(size=filter_size))
+            zoomed_images.append(pil_to_tensor(zoomed_image_pil))
+            sampler_inpaint_masks.append(pil_to_tensor(sampler_inpaint_mask_pil))
+
+        # 合并batch
+        zoomed_image_tensor = torch.cat(zoomed_images, dim=0)
+        sampler_inpaint_mask_tensor = torch.cat(sampler_inpaint_masks, dim=0)
+
+        # crop window mask 只需一张
         crop_window_mask_pil = Image.new("L", (orig_img_w, orig_img_h), 0)
         draw_crop_window = ImageDraw.Draw(crop_window_mask_pil)
         fc_box_rect_on_orig = (
@@ -346,7 +353,6 @@ class VideoFrameZoomerWithCropWindowMask:
             radius = feather_crop_window_mask_pixels # Treat as radius for GaussianBlur
             if radius > 0:
                 crop_window_mask_pil = crop_window_mask_pil.filter(ImageFilter.GaussianBlur(radius=radius))
-        
         crop_window_mask_tensor = pil_to_tensor(crop_window_mask_pil)
 
         applied_zoom_factor = float(zoomed_image_width) / fc_w if fc_w > 0 else 1.0
