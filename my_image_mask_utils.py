@@ -1,7 +1,88 @@
 # my_image_mask_utils.py
 
 import torch
-import numpy as np # Import numpy if either node uses it
+import numpy as np
+from PIL import Image, ImageFilter, ImageDraw # ImageFilter and ImageDraw are used by the new node
+
+# --- Helper Functions for VideoFrameZoomerWithCropWindowMask ---
+def tensor_to_pil(tensor_image, batch_index=0):
+    if tensor_image.is_cuda:
+        tensor_image = tensor_image.cpu()
+    if tensor_image.requires_grad:
+        tensor_image = tensor_image.detach()
+    
+    # Assuming tensor is B, H, W, C for IMAGE or B, H, W for MASK
+    image_np = tensor_image[batch_index].numpy() 
+    image_np = np.clip(image_np, 0.0, 1.0)
+
+    if image_np.ndim == 3 and image_np.shape[-1] in [1, 3, 4]: # H, W, C (IMAGE or MASK with channel)
+        if image_np.shape[-1] == 1: # Grayscale with channel dim (could be MASK)
+            image_np = image_np.squeeze(axis=-1) # H, W
+    # if image_np.ndim == 2: # H, W (MASK) - handled by squeeze above or already 2D
+    
+    if image_np.dtype == np.float32 or image_np.dtype == np.float64:
+        image_np = (image_np * 255).astype(np.uint8)
+    
+    try:
+        if image_np.ndim == 2: # Grayscale, for MASKs
+             image_pil = Image.fromarray(image_np, mode='L')
+        elif image_np.ndim == 3 and image_np.shape[-1] == 3: # RGB
+             image_pil = Image.fromarray(image_np, mode='RGB')
+        elif image_np.ndim == 3 and image_np.shape[-1] == 4: # RGBA
+             image_pil = Image.fromarray(image_np, mode='RGBA')
+        else:
+            raise ValueError(f"Unsupported NumPy array shape for PIL conversion: {image_np.shape}")
+    except Exception as e:
+        print(f"Error creating PIL image: {e}, array shape: {image_np.shape}, dtype: {image_np.dtype}")
+        return Image.new("RGB", (64, 64), "magenta") 
+
+    return image_pil
+
+
+def pil_to_tensor(image_pil):
+    image_np = np.array(image_pil).astype(np.float32) / 255.0
+    if image_np.ndim == 2: # L mode (masks)
+        # ComfyUI MASK is B, H, W
+        tensor_image = torch.from_numpy(image_np).unsqueeze(0) 
+    elif image_np.ndim == 3: # RGB or RGBA
+        # ComfyUI IMAGE is B, H, W, C
+        tensor_image = torch.from_numpy(image_np).unsqueeze(0)
+    else:
+        raise ValueError("Unsupported PIL image for tensor conversion (ndim not 2 or 3).")
+    return tensor_image
+
+
+def get_mask_bbox(mask_pil, threshold=0.5, padding_percent=0.1, original_image_width=None, original_image_height=None):
+    if mask_pil.mode != 'L':
+        mask_pil = mask_pil.convert('L')
+    mask_array = np.array(mask_pil) > (threshold * 255)
+    rows = np.any(mask_array, axis=1)
+    cols = np.any(mask_array, axis=0)
+    if not np.any(rows) or not np.any(cols):
+        if original_image_width and original_image_height:
+            # print("Warning: get_mask_bbox found no active pixels. Using center quarter.") # Less verbose
+            w, h = original_image_width // 2, original_image_height // 2
+            x, y = original_image_width // 4, original_image_height // 4
+            return float(x), float(y), float(w), float(h)
+        return None
+    ymin, ymax = np.where(rows)[0][[0, -1]]
+    xmin, xmax = np.where(cols)[0][[0, -1]]
+    bbox_w, bbox_h = float(xmax - xmin + 1), float(ymax - ymin + 1)
+    pad_w_amount = bbox_w * padding_percent
+    pad_h_amount = bbox_h * padding_percent
+    padded_x = float(xmin) - pad_w_amount
+    padded_y = float(ymin) - pad_h_amount
+    padded_w = bbox_w + 2 * pad_w_amount
+    padded_h = bbox_h + 2 * pad_h_amount
+    return padded_x, padded_y, padded_w, padded_h
+
+def round_to_multiple(number, multiple, min_val=None):
+    if multiple == 0: return int(number) 
+    rounded = round(number / multiple) * multiple
+    if min_val is not None:
+        return max(min_val, int(rounded))
+    return int(rounded)
+
 
 # --- Node 1: MaskGetCoords ---
 class MaskGetCoords:
@@ -17,22 +98,26 @@ class MaskGetCoords:
     RETURN_TYPES = ("INT", "INT", "INT", "INT")
     RETURN_NAMES = ("top_y", "bottom_y", "left_x", "right_x")
     FUNCTION = "get_coords"
-    CATEGORY = "utils/mask" # You can choose your own category
+    CATEGORY = "utils/mask" 
 
     def get_coords(self, mask, threshold):
+        # Ensure mask is B,H,W
+        if mask.dim() == 4 and mask.shape[-1] == 1: # B,H,W,C (where C=1)
+            mask = mask.squeeze(-1) # B,H,W
+        elif mask.dim() == 2: # H,W
+            mask = mask.unsqueeze(0) # 1,H,W
+        
         if mask.dim() != 3:
-             print(f"Warning: MaskGetCoords expected mask shape (N, H, W), got {mask.shape}. Proceeding with first slice.")
-             if mask.dim() == 2:
-                 mask = mask.unsqueeze(0)
-             elif mask.dim() != 3:
-                  raise ValueError(f"Unsupported mask dimension: {mask.dim()}. Expected (N, H, W) or (H, W).")
+             raise ValueError(f"MaskGetCoords: Unsupported mask dimension: {mask.shape}. Expected (N, H, W) or (H, W) or (N,H,W,1).")
 
-        n, h, w = mask.shape
-        mask_binarized = mask[0] > threshold
+        # Work with the first mask in the batch
+        mask_to_process = mask[0] 
+        
+        mask_binarized = mask_to_process > threshold
         non_zero_positions = torch.nonzero(mask_binarized)
 
         if non_zero_positions.shape[0] == 0:
-            print("Warning: MaskGetCoords found no active pixels above threshold.")
+            # print("Warning: MaskGetCoords found no active pixels above threshold.") # Less verbose
             return (0, 0, 0, 0)
 
         min_y = torch.min(non_zero_positions[:, 0]).item()
@@ -42,26 +127,25 @@ class MaskGetCoords:
 
         return (int(min_y), int(max_y), int(min_x), int(max_x))
 
-## --- Node 2: OverlayImageAtPosition (Modified from OverlayImageAtY) ---
-class OverlayImageAtPosition: # Renamed class
+## --- Node 2: OverlayImageAtPosition ---
+class OverlayImageAtPosition:
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "image_foreground": ("IMAGE",), # Expecting RGBA (N, H, W, 4)
-                "image_background": ("IMAGE",), # Can be RGB or RGBA (N, H, W, 3 or 4)
-                "position_y": ("INT", {"default": 0, "min": -99999, "max": 99999, "step": 1}), # Increased range just in case
-                "position_x": ("INT", {"default": 0, "min": -99999, "max": 99999, "step": 1}), # Added X position input
+                "image_foreground": ("IMAGE",), 
+                "image_background": ("IMAGE",), 
+                "position_y": ("INT", {"default": 0, "min": -99999, "max": 99999, "step": 1}),
+                "position_x": ("INT", {"default": 0, "min": -99999, "max": 99999, "step": 1}), 
             }
         }
 
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("image_combined",)
     FUNCTION = "overlay_image"
-    CATEGORY = "utils/image" # Or keep image/compositing
+    CATEGORY = "utils/image"
 
-    def overlay_image(self, image_foreground, image_background, position_y, position_x): # Added position_x parameter
-        # --- Input Validation and Preparation ---
+    def overlay_image(self, image_foreground, image_background, position_y, position_x):
         if image_foreground.dim() != 4 or image_background.dim() != 4:
             raise ValueError("Both foreground and background images must be 4D tensors (N, H, W, C)")
 
@@ -71,104 +155,223 @@ class OverlayImageAtPosition: # Renamed class
         if fg_n == 0 or bg_n == 0:
              raise ValueError("Input tensors cannot be empty")
 
-        # Work on the first image in the batch
         fg = image_foreground[0]
-        bg = image_background[0].clone() # Clone to avoid modifying original bg
+        bg = image_background[0].clone() 
         output_device = image_background.device
 
-        # Ensure foreground is RGBA
-        if fg_c != 4:
-            raise ValueError(f"Foreground image must have 4 channels (RGBA), but got {fg_c}")
+        if fg_c != 4: # Require RGBA for foreground for its alpha channel
+            # If RGB, add full alpha
+            if fg_c == 3:
+                # print("Warning: OverlayImageAtPosition converting RGB foreground to RGBA with full alpha.") # Less verbose
+                alpha_fg = torch.ones((fg_h, fg_w, 1), dtype=fg.dtype, device=fg.device)
+                fg = torch.cat((fg, alpha_fg), dim=-1)
+                fg_c = 4
+            else:
+                raise ValueError(f"Foreground image must have 3 (RGB) or 4 (RGBA) channels, but got {fg_c}")
 
-        # Ensure background is RGBA for compositing
+
         if bg_c == 3:
-            alpha = torch.ones((bg_h, bg_w, 1), dtype=bg.dtype, device=bg.device)
-            bg = torch.cat((bg, alpha), dim=-1)
+            alpha_bg = torch.ones((bg_h, bg_w, 1), dtype=bg.dtype, device=bg.device)
+            bg = torch.cat((bg, alpha_bg), dim=-1)
             bg_c = 4
         elif bg_c != 4:
             raise ValueError(f"Background image must have 3 (RGB) or 4 (RGBA) channels, but got {bg_c}")
 
-        # --- Calculate Placement and Clipping ---
-        # Define the target area on the background based on inputs
         target_y_start = position_y
         target_y_end = position_y + fg_h
-        target_x_start = position_x # Use position_x for the left edge
-        target_x_end = position_x + fg_w # Calculate right edge based on position_x
+        target_x_start = position_x
+        target_x_end = position_x + fg_w
 
-        # Define the source area from the foreground (initially the whole image)
         source_y_start = 0
         source_y_end = fg_h
         source_x_start = 0
         source_x_end = fg_w
 
-        # --- Clip coordinates against background boundaries ---
-
-        # Clip Y (Vertical) - Adjust source and target if necessary
         if target_y_start < 0:
-            source_y_start = -target_y_start # Start reading fg later
-            target_y_start = 0             # Start writing bg at the top
+            source_y_start = -target_y_start
+            target_y_start = 0
         if target_y_end > bg_h:
-            source_y_end = fg_h - (target_y_end - bg_h) # Read less of fg
-            target_y_end = bg_h                        # Write up to bg bottom
+            source_y_end = fg_h - (target_y_end - bg_h)
+            target_y_end = bg_h
 
-        # Clip X (Horizontal) - Adjust source and target if necessary
         if target_x_start < 0:
-            source_x_start = -target_x_start # Start reading fg later (from the right)
-            target_x_start = 0             # Start writing bg at the left edge
+            source_x_start = -target_x_start
+            target_x_start = 0
         if target_x_end > bg_w:
-            source_x_end = fg_w - (target_x_end - bg_w) # Read less of fg (from the left)
-            target_x_end = bg_w                        # Write up to bg right edge
+            source_x_end = fg_w - (target_x_end - bg_w)
+            target_x_end = bg_w
 
-
-        # --- Check if there is any overlap left after clipping ---
         if target_y_start >= target_y_end or target_x_start >= target_x_end or \
            source_y_start >= source_y_end or source_x_start >= source_x_end or \
-           source_y_end <= 0 or source_x_end <= 0: # Added check for negative source end indices
-            print("Warning: Foreground image placement is entirely outside the background boundaries. Returning original background.")
-            return bg.unsqueeze(0).to(output_device) # Return original (potentially RGBA converted) background
+           source_y_end <= 0 or source_x_end <= 0:
+            # print("Warning: Foreground image placement is entirely outside. Returning background.") # Less verbose
+            return bg.unsqueeze(0).to(output_device) 
 
-        # --- Perform Alpha Compositing ---
-
-        # Extract the relevant slices based on calculated source/target ranges
         fg_slice = fg[source_y_start:source_y_end, source_x_start:source_x_end, :]
         bg_slice = bg[target_y_start:target_y_end, target_x_start:target_x_end, :]
 
-        # Separate color and alpha channels
         fg_color = fg_slice[..., :3]
-        fg_alpha = fg_slice[..., 3:] # Keep the last dimension (H_clip, W_clip, 1)
-
+        fg_alpha = fg_slice[..., 3:] 
         bg_color = bg_slice[..., :3]
-        bg_alpha = bg_slice[..., 3:] # Background alpha
+        bg_alpha = bg_slice[..., 3:] 
 
-        # Calculate composite color: C = Cf*Af + Cb*(1-Af)
         composite_color = fg_color * fg_alpha + bg_color * (1.0 - fg_alpha)
-
-        # Calculate composite alpha: A = Af + Ab*(1-Af)
         composite_alpha = fg_alpha + bg_alpha * (1.0 - fg_alpha)
-
-        # Combine composite color and alpha
         composite_area = torch.cat((composite_color, composite_alpha), dim=-1)
-
-        # Place the composited area back onto the background clone
         bg[target_y_start:target_y_end, target_x_start:target_x_end, :] = composite_area
-
-        # --- Return Result ---
-        # Add the batch dimension back and ensure it's on the right device
         result_image = bg.unsqueeze(0).to(output_device)
         return (result_image,)
+
+# --- Node 3: VideoFrameZoomerWithCropWindowMask (NEW NODE) ---
+class VideoFrameZoomerWithCropWindowMask:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "mask": ("MASK",), 
+                "target_zoom_factor": ("FLOAT", {"default": 2.0, "min": 0.1, "max": 16.0, "step": 0.1}),
+                "roi_padding_percent": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 2.0, "step": 0.05}),
+                "mask_threshold_for_bbox": ("FLOAT", {"default": 0.5, "min": 0.01, "max": 0.99, "step": 0.01}),
+                "dilate_sampler_mask_pixels": ("INT", {"default": 0, "min": 0, "max": 64, "step": 1}),
+                "feather_crop_window_mask_pixels": ("INT", {"default": 0, "min": 0, "max": 64, "step": 1}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK", "MASK", "FLOAT", "INT", "INT", "INT", "INT") 
+    RETURN_NAMES = ("ZOOMED_IMAGE", "SAMPLER_INPAINT_MASK", "CROP_WINDOW_ON_ORIGINAL_IMAGE_MASK",
+                    "APPLIED_ZOOM_FACTOR", 
+                    "ROI_X_ON_ORIGINAL", "ROI_Y_ON_ORIGINAL",
+                    "ZOOMED_IMAGE_WIDTH", "ZOOMED_IMAGE_HEIGHT")
+    FUNCTION = "process_frame"
+    CATEGORY = "utils/image" # Changed category to match others, or use "VideoTools/Detailer"
+
+    def process_frame(self, image: torch.Tensor, mask: torch.Tensor, 
+                      target_zoom_factor: float,
+                      roi_padding_percent: float, mask_threshold_for_bbox: float,
+                      dilate_sampler_mask_pixels: int,
+                      feather_crop_window_mask_pixels: int):
+
+        img_pil = tensor_to_pil(image) # Expects B,H,W,C
+        original_segmentation_mask_pil = tensor_to_pil(mask) # Expects B,H,W
+
+        orig_img_w, orig_img_h = img_pil.size
+
+        padded_roi_orig_coords = get_mask_bbox(original_segmentation_mask_pil, mask_threshold_for_bbox, roi_padding_percent, orig_img_w, orig_img_h)
+        
+        dummy_output_w = round_to_multiple(orig_img_w / 2, 16, 64) 
+        dummy_output_h = round_to_multiple(orig_img_h / 2, 16, 64)
+
+        if padded_roi_orig_coords is None:
+            # print("Error: VideoFrameZoomer could not determine ROI. Dummy outputs.") # Less verbose
+            dummy_zi = pil_to_tensor(Image.new("RGB", (dummy_output_w, dummy_output_h), "black"))
+            dummy_sim = pil_to_tensor(Image.new("L", (dummy_output_w, dummy_output_h), "black"))
+            dummy_cwom = pil_to_tensor(Image.new("L", (orig_img_w, orig_img_h), "black"))
+            return (dummy_zi, dummy_sim, dummy_cwom, 1.0, 0, 0, dummy_output_w, dummy_output_h)
+            
+        pr_x, pr_y, pr_w, pr_h = padded_roi_orig_coords 
+        
+        if pr_w <=0 or pr_h <=0:
+            # print(f"Warning: VideoFrameZoomer invalid padded ROI. Using full image.") # Less verbose
+            pr_x, pr_y, pr_w, pr_h = 0.0, 0.0, float(orig_img_w), float(orig_img_h)
+
+        initial_target_w = pr_w * target_zoom_factor
+        initial_target_h = pr_h * target_zoom_factor
+        zoomed_image_width = round_to_multiple(initial_target_w, 16, min_val=16)
+        zoomed_image_height = round_to_multiple(initial_target_h, 16, min_val=16)
+
+        target_aspect = float(zoomed_image_width) / zoomed_image_height if zoomed_image_height > 0 else 1.0
+        padded_roi_center_x = pr_x + pr_w / 2.0
+        padded_roi_center_y = pr_y + pr_h / 2.0
+
+        if pr_w == 0 or pr_h == 0 : # Avoid division by zero if pr_h is 0
+             fc_w = pr_w 
+             fc_h = pr_h
+        elif pr_w / pr_h > target_aspect:
+            fc_w = pr_w
+            fc_h = pr_w / target_aspect if target_aspect > 0 else pr_h # Avoid division by zero
+        else:
+            fc_h = pr_h
+            fc_w = pr_h * target_aspect
+        
+        fc_x = padded_roi_center_x - fc_w / 2.0
+        fc_y = padded_roi_center_y - fc_h / 2.0
+
+        src_crop_x = max(0, fc_x)
+        src_crop_y = max(0, fc_y)
+        src_crop_x_end = min(orig_img_w, fc_x + fc_w)
+        src_crop_y_end = min(orig_img_h, fc_y + fc_h)
+        src_rect_w = src_crop_x_end - src_crop_x
+        src_rect_h = src_crop_y_end - src_crop_y
+        dst_paste_x_on_canvas = src_crop_x - fc_x
+        dst_paste_y_on_canvas = src_crop_y - fc_y
+        
+        int_fc_w, int_fc_h = int(round(fc_w)), int(round(fc_h))
+        if int_fc_w <= 0 or int_fc_h <= 0:
+            # print(f"Error: VideoFrameZoomer final crop canvas dimensions invalid. Dummy.") # Less verbose
+            dummy_zi = pil_to_tensor(Image.new("RGB", (zoomed_image_width, zoomed_image_height), "black"))
+            dummy_sim = pil_to_tensor(Image.new("L", (zoomed_image_width, zoomed_image_height), "black"))
+            dummy_cwom = pil_to_tensor(Image.new("L", (orig_img_w, orig_img_h), "black"))
+            return (dummy_zi, dummy_sim, dummy_cwom, 1.0, 0, 0, zoomed_image_width, zoomed_image_height)
+
+        img_canvas_unscaled = Image.new("RGB", (int_fc_w, int_fc_h), (0,0,0))
+        mask_canvas_unscaled = Image.new("L", (int_fc_w, int_fc_h), 0) 
+        if src_rect_w > 0 and src_rect_h > 0:
+            img_cropped_from_orig = img_pil.crop((int(round(src_crop_x)), int(round(src_crop_y)), 
+                                                  int(round(src_crop_x_end)), int(round(src_crop_y_end))))
+            mask_content_cropped = original_segmentation_mask_pil.crop((int(round(src_crop_x)), int(round(src_crop_y)),
+                                                                        int(round(src_crop_x_end)), int(round(src_crop_y_end))))
+            img_canvas_unscaled.paste(img_cropped_from_orig, (int(round(dst_paste_x_on_canvas)), int(round(dst_paste_y_on_canvas))))
+            mask_canvas_unscaled.paste(mask_content_cropped, (int(round(dst_paste_x_on_canvas)), int(round(dst_paste_y_on_canvas))))
+        
+        zoomed_image_pil = img_canvas_unscaled.resize((zoomed_image_width, zoomed_image_height), Image.LANCZOS)
+        sampler_inpaint_mask_pil = mask_canvas_unscaled.resize((zoomed_image_width, zoomed_image_height), Image.NEAREST)
+        
+        if dilate_sampler_mask_pixels > 0:
+            filter_size = dilate_sampler_mask_pixels * 2 + 1
+            if filter_size > 1: 
+                 sampler_inpaint_mask_pil = sampler_inpaint_mask_pil.filter(ImageFilter.MaxFilter(size=filter_size))
+        
+        zoomed_image_tensor = pil_to_tensor(zoomed_image_pil) 
+        sampler_inpaint_mask_tensor = pil_to_tensor(sampler_inpaint_mask_pil)
+        
+        crop_window_mask_pil = Image.new("L", (orig_img_w, orig_img_h), 0)
+        draw_crop_window = ImageDraw.Draw(crop_window_mask_pil)
+        fc_box_rect_on_orig = (
+            int(round(fc_x)), int(round(fc_y)),
+            int(round(fc_x + fc_w)), int(round(fc_y + fc_h))
+        )
+        draw_crop_window.rectangle(fc_box_rect_on_orig, fill=255) 
+        if feather_crop_window_mask_pixels > 0:
+            radius = feather_crop_window_mask_pixels # Treat as radius for GaussianBlur
+            if radius > 0:
+                crop_window_mask_pil = crop_window_mask_pil.filter(ImageFilter.GaussianBlur(radius=radius))
+        
+        crop_window_mask_tensor = pil_to_tensor(crop_window_mask_pil)
+
+        applied_zoom_factor = float(zoomed_image_width) / fc_w if fc_w > 0 else 1.0
+        roi_x_on_original = int(round(fc_x))
+        roi_y_on_original = int(round(fc_y))
+
+        return (zoomed_image_tensor, sampler_inpaint_mask_tensor, crop_window_mask_tensor,
+                applied_zoom_factor, 
+                roi_x_on_original, roi_y_on_original,
+                zoomed_image_width, zoomed_image_height)
 
 
 # --- Registration: Update mappings ---
 NODE_CLASS_MAPPINGS = {
     "Mask Get Bounding Coords": MaskGetCoords,
-    "OverlayImageAtPosition": OverlayImageAtPosition # Updated class name
+    "OverlayImageAtPosition": OverlayImageAtPosition,
+    "VideoFrameZoomerWithCropWindowMask": VideoFrameZoomerWithCropWindowMask # Added new node
 }
 
 # --- Display Name Mappings: Update display name ---
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Mask Get Bounding Coords": "Get Mask Coords",
-    "OverlayImageAtPosition": "Overlay Image at Position" # Updated display name
+    "OverlayImageAtPosition": "Overlay Image at Position",
+    "VideoFrameZoomerWithCropWindowMask": "Zoom Frame for Detailer" # Added display name
 }
 
 # (Keep the print statement at the end if you like)
-print("--- My Custom Nodes Loaded: Mask/Image Utils ---")
+print("--- My Custom Nodes Loaded: Mask/Image Utils (with Zoomer) ---")

@@ -1,3 +1,4 @@
+#__init__.py
 # Import the mappings from your node file
 from .my_image_mask_utils import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 
