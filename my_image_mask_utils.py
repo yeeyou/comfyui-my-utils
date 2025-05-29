@@ -3,7 +3,7 @@
 import torch
 import numpy as np
 from PIL import Image, ImageFilter, ImageDraw # ImageFilter and ImageDraw are used by the new node
-
+import json
 # --- Helper Functions for VideoFrameZoomerWithCropWindowMask ---
 def tensor_to_pil(tensor_image, batch_index=0):
     if tensor_image.is_cuda:
@@ -366,100 +366,131 @@ class VideoFrameZoomerWithCropWindowMask:
 
 
 # --- Node 4: SegsToBBOXesModule (NEW NODE) ---
-class SegsToBBOXesModule:
+class SegsToCoordinatesAndBBOXes: # Renamed for clarity
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "segs": ("SEGS",), # This SEGS is the top-level tuple from your output
-            }
+                "segs": ("SEGS",), # The top-level tuple: ( (img_dims), [SEG_obj, ...] )
+                "index": ("STRING", {"default": "", "multiline": False, "dynamicPrompts": False}), # Comma-separated list of indices, or empty for all
+            },
+            # "optional": { # Could add a batch flag if you ever process lists of SEGS, but current SEGS is usually for one image
+            #     "batch_processing": ("BOOLEAN", {"default": False}),
+            # }
         }
 
-    RETURN_TYPES = ("BBOX",)
-    RETURN_NAMES = ("bboxes",)
-    FUNCTION = "convert_segs_to_bboxes"
-    CATEGORY = "ImpactPackUtils"
+    RETURN_TYPES = ("STRING", "BBOX")
+    RETURN_NAMES = ("center_coordinates", "bboxes")
+    FUNCTION = "extract_data"
+    CATEGORY = "ImpactPackUtils" # Or your preferred category
 
-    def convert_segs_to_bboxes(self, segs):
-        bboxes_list = []
+    def extract_data(self, segs, index):
+        extracted_bboxes = []
+        center_points_data = []
+
+        default_empty_coords_json = json.dumps([{'x': 0, 'y': 0}]) # Default if no valid data
 
         if segs is None:
-            print("SegsToBBOXesModule: Input 'segs' is None. Returning empty bboxes list.")
-            return (bboxes_list,)
+            print(f"{self.__class__.__name__}: Input 'segs' is None. Returning default empty data.")
+            return (default_empty_coords_json, [])
 
-        # Validate top-level structure: a tuple with at least 2 elements
         if not isinstance(segs, tuple) or len(segs) < 2:
-            print(f"SegsToBBOXesModule: Expected 'segs' to be a tuple with at least 2 elements, but got {type(segs)} with length {len(segs) if isinstance(segs, tuple) else 'N/A'}. Returning empty.")
-            return (bboxes_list,)
+            print(f"{self.__class__.__name__}: Expected 'segs' to be a tuple with at least 2 elements. Got {type(segs)}. Returning default.")
+            return (default_empty_coords_json, [])
         
-        # The actual list of SEG objects is the second element of the input tuple
         seg_object_list = segs[1]
 
         if not isinstance(seg_object_list, list):
-            print(f"SegsToBBOXesModule: Expected item at index 1 of 'segs' (seg_object_list) to be a list, but got {type(seg_object_list)}. Returning empty.")
-            return (bboxes_list,)
+            print(f"{self.__class__.__name__}: Expected item at index 1 of 'segs' (seg_object_list) to be a list. Got {type(seg_object_list)}. Returning default.")
+            return (default_empty_coords_json, [])
         
         if not seg_object_list:
-            print("SegsToBBOXesModule: The list of SEG objects is empty. Returning empty bboxes list.")
-            return (bboxes_list,)
+            print(f"{self.__class__.__name__}: The list of SEG objects is empty. Returning default empty data.")
+            return (default_empty_coords_json, [])
+
+        # Process indices
+        target_indices = []
+        if index.strip(): # If index string is provided and not empty
+            try:
+                target_indices = [int(i.strip()) for i in index.split(",")]
+            except ValueError:
+                print(f"{self.__class__.__name__}: Warning - Invalid format in 'index' string: '{index}'. Processing all bboxes instead.")
+                target_indices = list(range(len(seg_object_list))) # Fallback to all if index is malformed
+        else: # If index string is empty, process all bboxes
+            target_indices = list(range(len(seg_object_list)))
+
+        print(f"{self.__class__.__name__}: Target indices to process: {target_indices}")
 
         for i, seg_object in enumerate(seg_object_list):
-            # SEG objects might be instances of a custom class or named tuples
-            # We need to access the 'bbox' attribute
+            if i not in target_indices: # Only process selected indices
+                continue
+
             if not hasattr(seg_object, 'bbox'):
-                print(f"SegsToBBOXesModule: Warning - SEG object {i} does not have a 'bbox' attribute. Skipping.")
+                print(f"{self.__class__.__name__}: Warning - SEG object at original index {i} does not have 'bbox' attribute. Skipping.")
                 continue
             
-            bbox_data = seg_object.bbox # This should be a list, tuple, or numpy array of 4 numbers
+            bbox_data = seg_object.bbox
 
-            # Validate the type and content of bbox_data
+            # Validate and convert bbox_data (similar to previous version)
+            bbox_coords_list = None
             if isinstance(bbox_data, np.ndarray):
-                # If it's a numpy array, convert to list
-                # Ensure it's a 1D array of 4 elements
                 if bbox_data.ndim == 1 and bbox_data.shape[0] == 4:
                     bbox_coords_list = bbox_data.tolist()
                 else:
-                    print(f"SegsToBBOXesModule: Warning - 'bbox' attribute for SEG object {i} is a numpy array but not in expected shape (1,4). Shape: {bbox_data.shape}. Skipping.")
+                    print(f"{self.__class__.__name__}: Warning - 'bbox' for SEG object {i} (numpy) not shape (1,4). Shape: {bbox_data.shape}. Skipping.")
                     continue
             elif isinstance(bbox_data, (list, tuple)):
                 if len(bbox_data) == 4:
                     bbox_coords_list = list(bbox_data)
                 else:
-                    print(f"SegsToBBOXesModule: Warning - 'bbox' attribute for SEG object {i} is a list/tuple but not of length 4 (length: {len(bbox_data)}). Skipping.")
+                    print(f"{self.__class__.__name__}: Warning - 'bbox' for SEG object {i} (list/tuple) not length 4. Len: {len(bbox_data)}. Skipping.")
                     continue
             else:
-                print(f"SegsToBBOXesModule: Warning - 'bbox' attribute for SEG object {i} is not a list, tuple, or numpy array (type: {type(bbox_data)}). Skipping.")
+                print(f"{self.__class__.__name__}: Warning - 'bbox' for SEG object {i} not list/tuple/numpy array. Type: {type(bbox_data)}. Skipping.")
                 continue
 
-            # Validate that all elements in bbox_coords_list are numbers
             valid_coords_format = True
-            numeric_bbox = []
+            numeric_bbox_for_calc = []
             for coord_idx, coord_val in enumerate(bbox_coords_list):
-                if not isinstance(coord_val, (int, float, np.number)): # np.number for numpy scalars
-                    print(f"SegsToBBOXesModule: Warning - Coordinate {coord_idx} in bbox of SEG object {i} is not a number (value: {coord_val}, type: {type(coord_val)}). Skipping this bbox.")
+                if not isinstance(coord_val, (int, float, np.number)):
+                    print(f"{self.__class__.__name__}: Warning - Coord {coord_idx} in bbox of SEG object {i} not number. Val: {coord_val}, Type: {type(coord_val)}. Skipping bbox.")
                     valid_coords_format = False
                     break
-                # Optionally convert to int here if downstream nodes require it
-                # For Sam2Segmentation, floats should be fine as it converts to numpy array
-                numeric_bbox.append(float(coord_val)) # Ensure float for consistency if mixed
+                numeric_bbox_for_calc.append(float(coord_val))
             
             if valid_coords_format:
-                bboxes_list.append(numeric_bbox)
+                # bbox is [x_min, y_min, x_max, y_max]
+                min_x, min_y, max_x, max_y = numeric_bbox_for_calc
+                
+                # Calculate center coordinates
+                center_x = int((min_x + max_x) / 2)
+                center_y = int((min_y + max_y) / 2)
+                
+                center_points_data.append({"x": center_x, "y": center_y})
+                extracted_bboxes.append(numeric_bbox_for_calc) # Use the float version for consistency
+            else:
+                # If an index was specified but the bbox at that index was invalid,
+                # we might want to indicate this more clearly or return a specific error.
+                # For now, it's just skipped.
+                pass
+        
+        if not extracted_bboxes: # If loop finished and nothing was extracted (e.g., all specified indices were invalid/out of bounds)
+            print(f"{self.__class__.__name__}: No valid bboxes found for the specified indices or overall. Returning default empty data.")
+            return (default_empty_coords_json, [])
+        
+        coordinates_json_string = json.dumps(center_points_data)
+        print(f"{self.__class__.__name__}: Extracted {len(extracted_bboxes)} bboxes and {len(center_points_data)} center coordinates.")
+        print(f"{self.__class__.__name__}: Center Coordinates JSON: {coordinates_json_string}")
+        print(f"{self.__class__.__name__}: BBOXes: {extracted_bboxes}")
             
-        if not bboxes_list:
-            print("SegsToBBOXesModule: No valid bboxes extracted. Returning empty bboxes list.")
-        else:
-            print(f"SegsToBBOXesModule: Extracted {len(bboxes_list)} bboxes: {bboxes_list}")
-            
-        return (bboxes_list,)
-
+        return (coordinates_json_string, extracted_bboxes)
 
 # --- Registration: Update mappings ---
 NODE_CLASS_MAPPINGS = {
     "Mask Get Bounding Coords": MaskGetCoords,
     "OverlayImageAtPosition": OverlayImageAtPosition,
     "VideoFrameZoomerWithCropWindowMask": VideoFrameZoomerWithCropWindowMask,
-    "SegsToBBOXes (Impact)": SegsToBBOXesModule # Added new node
+    "SegsToCoordinatesAndBBOXes (Impact)": SegsToCoordinatesAndBBOXes # Added new node
 }
 
 # --- Display Name Mappings: Update display name ---
@@ -467,7 +498,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Mask Get Bounding Coords": "Get Mask Coords",
     "OverlayImageAtPosition": "Overlay Image at Position",
     "VideoFrameZoomerWithCropWindowMask": "Zoom Frame for Detailer",
-    "SegsToBBOXes (Impact)": "SEGS to BBOXes (Impact)" # Added display name
+    "SegsToCoordinatesAndBBOXes (Impact)": "SEGS to BBOXes and Coordinates  (Impact)" # Added display name
 }
 
 # (Keep the print statement at the end if you like)
