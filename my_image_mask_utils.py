@@ -365,18 +365,70 @@ class VideoFrameZoomerWithCropWindowMask:
                 zoomed_image_width, zoomed_image_height)
 
 
+# --- Node 4: SegsToBBOXesModule (NEW NODE) ---
+class SegsToBBOXesModule: # Renamed class to avoid potential conflicts
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "segs": ("SEGS",),  # Input type is SEGS, as defined by Impact Pack
+            }
+        }
+
+    RETURN_TYPES = ("BBOX",)  # Output type is BBOX, as defined by Impact Pack for a list of bboxes
+    RETURN_NAMES = ("bboxes",)
+    FUNCTION = "convert_segs_to_bboxes"
+    CATEGORY = "ImpactPackUtils" # Or your preferred category
+
+    def convert_segs_to_bboxes(self, segs):
+        if segs is None:
+            print("Warning: SegsToBBOXes received None for segs. Returning empty list.")
+            return ([],)
+
+        bboxes_list = []
+        # SEGS is a list of tuples.
+        # Each tuple (segment) typically has the structure:
+        # (cropped_image, cropped_mask, crop_region, confidence, label, optional_cropped_image_for_paste, optional_noise_mask)
+        # We are interested in crop_region, which is at index 2.
+        for seg_tuple in segs:
+            if len(seg_tuple) > 2 and isinstance(seg_tuple[2], (list, tuple)) and len(seg_tuple[2]) == 4:
+                # crop_region is seg_tuple[2]
+                bbox = seg_tuple[2]
+                # Ensure it's a list of numbers (usually ints, but float is fine too for some consumers)
+                try:
+                    # Convert to int, as bboxes are typically integer coordinates
+                    # However, some nodes might accept floats.
+                    # If Sam2Segmentation expects ints, this is good.
+                    # If it expects the raw floats from detection, remove the int conversion.
+                    # Based on your previous traceback with Sam2Segmentation, it seems to work with numpy arrays of numbers.
+                    # The BBOX type from Impact Pack usually handles this fine.
+                    numeric_bbox = [int(coord) for coord in bbox]
+                    bboxes_list.append(numeric_bbox)
+                except ValueError:
+                    print(f"Warning: Could not convert coordinates to int for bbox: {bbox}. Skipping.")
+                    # If conversion fails, you might append the original bbox or skip
+                    # bboxes_list.append(list(bbox)) # Add original if int conversion is not strictly needed
+            else:
+                print(f"Warning: Segment tuple does not have a valid bbox at index 2 or wrong format: {seg_tuple}")
+        
+        # The "BBOX" type in Impact Pack expects a list of these bbox lists.
+        return (bboxes_list,)
+
+
 # --- Registration: Update mappings ---
 NODE_CLASS_MAPPINGS = {
     "Mask Get Bounding Coords": MaskGetCoords,
     "OverlayImageAtPosition": OverlayImageAtPosition,
-    "VideoFrameZoomerWithCropWindowMask": VideoFrameZoomerWithCropWindowMask # Added new node
+    "VideoFrameZoomerWithCropWindowMask": VideoFrameZoomerWithCropWindowMask,
+    "SegsToBBOXes (Impact)": SegsToBBOXesModule # Added new node
 }
 
 # --- Display Name Mappings: Update display name ---
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Mask Get Bounding Coords": "Get Mask Coords",
     "OverlayImageAtPosition": "Overlay Image at Position",
-    "VideoFrameZoomerWithCropWindowMask": "Zoom Frame for Detailer" # Added display name
+    "VideoFrameZoomerWithCropWindowMask": "Zoom Frame for Detailer",
+    "SegsToBBOXes (Impact)": "SEGS to BBOXes (Impact)" # Added display name
 }
 
 # (Keep the print statement at the end if you like)
