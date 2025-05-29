@@ -366,52 +366,91 @@ class VideoFrameZoomerWithCropWindowMask:
 
 
 # --- Node 4: SegsToBBOXesModule (NEW NODE) ---
-class SegsToBBOXesModule: # Renamed class to avoid potential conflicts
+class SegsToBBOXesModule:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "segs": ("SEGS",),  # Input type is SEGS, as defined by Impact Pack
+                "segs": ("SEGS",), # This SEGS is the top-level tuple from your output
             }
         }
 
-    RETURN_TYPES = ("BBOX",)  # Output type is BBOX, as defined by Impact Pack for a list of bboxes
+    RETURN_TYPES = ("BBOX",)
     RETURN_NAMES = ("bboxes",)
     FUNCTION = "convert_segs_to_bboxes"
-    CATEGORY = "ImpactPackUtils" # Or your preferred category
+    CATEGORY = "ImpactPackUtils"
 
     def convert_segs_to_bboxes(self, segs):
-        if segs is None:
-            print("Warning: SegsToBBOXes received None for segs. Returning empty list.")
-            return ([],)
-
         bboxes_list = []
-        # SEGS is a list of tuples.
-        # Each tuple (segment) typically has the structure:
-        # (cropped_image, cropped_mask, crop_region, confidence, label, optional_cropped_image_for_paste, optional_noise_mask)
-        # We are interested in crop_region, which is at index 2.
-        for seg_tuple in segs:
-            if len(seg_tuple) > 2 and isinstance(seg_tuple[2], (list, tuple)) and len(seg_tuple[2]) == 4:
-                # crop_region is seg_tuple[2]
-                bbox = seg_tuple[2]
-                # Ensure it's a list of numbers (usually ints, but float is fine too for some consumers)
-                try:
-                    # Convert to int, as bboxes are typically integer coordinates
-                    # However, some nodes might accept floats.
-                    # If Sam2Segmentation expects ints, this is good.
-                    # If it expects the raw floats from detection, remove the int conversion.
-                    # Based on your previous traceback with Sam2Segmentation, it seems to work with numpy arrays of numbers.
-                    # The BBOX type from Impact Pack usually handles this fine.
-                    numeric_bbox = [int(coord) for coord in bbox]
-                    bboxes_list.append(numeric_bbox)
-                except ValueError:
-                    print(f"Warning: Could not convert coordinates to int for bbox: {bbox}. Skipping.")
-                    # If conversion fails, you might append the original bbox or skip
-                    # bboxes_list.append(list(bbox)) # Add original if int conversion is not strictly needed
-            else:
-                print(f"Warning: Segment tuple does not have a valid bbox at index 2 or wrong format: {seg_tuple}")
+
+        if segs is None:
+            print("SegsToBBOXesModule: Input 'segs' is None. Returning empty bboxes list.")
+            return (bboxes_list,)
+
+        # Validate top-level structure: a tuple with at least 2 elements
+        if not isinstance(segs, tuple) or len(segs) < 2:
+            print(f"SegsToBBOXesModule: Expected 'segs' to be a tuple with at least 2 elements, but got {type(segs)} with length {len(segs) if isinstance(segs, tuple) else 'N/A'}. Returning empty.")
+            return (bboxes_list,)
         
-        # The "BBOX" type in Impact Pack expects a list of these bbox lists.
+        # The actual list of SEG objects is the second element of the input tuple
+        seg_object_list = segs[1]
+
+        if not isinstance(seg_object_list, list):
+            print(f"SegsToBBOXesModule: Expected item at index 1 of 'segs' (seg_object_list) to be a list, but got {type(seg_object_list)}. Returning empty.")
+            return (bboxes_list,)
+        
+        if not seg_object_list:
+            print("SegsToBBOXesModule: The list of SEG objects is empty. Returning empty bboxes list.")
+            return (bboxes_list,)
+
+        for i, seg_object in enumerate(seg_object_list):
+            # SEG objects might be instances of a custom class or named tuples
+            # We need to access the 'bbox' attribute
+            if not hasattr(seg_object, 'bbox'):
+                print(f"SegsToBBOXesModule: Warning - SEG object {i} does not have a 'bbox' attribute. Skipping.")
+                continue
+            
+            bbox_data = seg_object.bbox # This should be a list, tuple, or numpy array of 4 numbers
+
+            # Validate the type and content of bbox_data
+            if isinstance(bbox_data, np.ndarray):
+                # If it's a numpy array, convert to list
+                # Ensure it's a 1D array of 4 elements
+                if bbox_data.ndim == 1 and bbox_data.shape[0] == 4:
+                    bbox_coords_list = bbox_data.tolist()
+                else:
+                    print(f"SegsToBBOXesModule: Warning - 'bbox' attribute for SEG object {i} is a numpy array but not in expected shape (1,4). Shape: {bbox_data.shape}. Skipping.")
+                    continue
+            elif isinstance(bbox_data, (list, tuple)):
+                if len(bbox_data) == 4:
+                    bbox_coords_list = list(bbox_data)
+                else:
+                    print(f"SegsToBBOXesModule: Warning - 'bbox' attribute for SEG object {i} is a list/tuple but not of length 4 (length: {len(bbox_data)}). Skipping.")
+                    continue
+            else:
+                print(f"SegsToBBOXesModule: Warning - 'bbox' attribute for SEG object {i} is not a list, tuple, or numpy array (type: {type(bbox_data)}). Skipping.")
+                continue
+
+            # Validate that all elements in bbox_coords_list are numbers
+            valid_coords_format = True
+            numeric_bbox = []
+            for coord_idx, coord_val in enumerate(bbox_coords_list):
+                if not isinstance(coord_val, (int, float, np.number)): # np.number for numpy scalars
+                    print(f"SegsToBBOXesModule: Warning - Coordinate {coord_idx} in bbox of SEG object {i} is not a number (value: {coord_val}, type: {type(coord_val)}). Skipping this bbox.")
+                    valid_coords_format = False
+                    break
+                # Optionally convert to int here if downstream nodes require it
+                # For Sam2Segmentation, floats should be fine as it converts to numpy array
+                numeric_bbox.append(float(coord_val)) # Ensure float for consistency if mixed
+            
+            if valid_coords_format:
+                bboxes_list.append(numeric_bbox)
+            
+        if not bboxes_list:
+            print("SegsToBBOXesModule: No valid bboxes extracted. Returning empty bboxes list.")
+        else:
+            print(f"SegsToBBOXesModule: Extracted {len(bboxes_list)} bboxes: {bboxes_list}")
+            
         return (bboxes_list,)
 
 
